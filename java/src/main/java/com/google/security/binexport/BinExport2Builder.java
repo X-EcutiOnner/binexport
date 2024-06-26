@@ -15,6 +15,8 @@
 package com.google.security.binexport;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.protobuf.ByteString;
 import com.google.security.zynamics.BinExport.BinExport2;
 import com.google.security.zynamics.BinExport.BinExport2.Builder;
@@ -34,9 +36,12 @@ import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.LabelString;
+import ghidra.program.model.listing.Library;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.listing.VariableOffset;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.scalar.Scalar;
@@ -53,8 +58,10 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.function.ToIntFunction;
 import util.CollectionUtils;
@@ -78,6 +85,10 @@ public class BinExport2Builder {
   private long addressOffset = 0;
   private boolean prependNamespace = false;
   private final Map<Address, Address> externalLinkageAddressMapping = new HashMap<>();
+
+  private final HashMap<BinExport2.Expression, Integer> expressionIndices = new HashMap<>();
+  private final HashMap<BinExport2.Operand, Integer> operandIndices = new HashMap<>();
+  private final HashMap<String, Integer> stringIndices = new HashMap<>();
 
   public BinExport2Builder(Program ghidraProgram, AddressSetView ghidraAddrSet) {
     program = ghidraProgram;
@@ -114,6 +125,8 @@ public class BinExport2Builder {
   }
 
   private Address getExternalLinkageAddress(Address extAddr) {
+    // External addresses exist in the EXTERNAL address space e.g. EXTERNAL:00000001
+    // We must map these to the linkage address referenced by instructions
     return externalLinkageAddressMapping.computeIfAbsent(
         extAddr,
         address -> {
@@ -141,27 +154,380 @@ public class BinExport2Builder {
         .setTimestamp(System.currentTimeMillis() / 1000);
   }
 
-  private void buildExpressions(Map<String, Integer> expressionIndices) {
-    var cuf = new CodeUnitFormat(new CodeUnitFormatOptions());
-    int id = 0;
-    for (Instruction instr : listing.getInstructions(true)) {
-      for (int i = 0; i < instr.getNumOperands(); i++) {
-        String opRep = cuf.getOperandRepresentationString(instr, i);
-        if (expressionIndices.putIfAbsent(opRep, id) != null) {
-          continue;
-        }
-        id++;
-        builder.addExpressionBuilder().setType(BinExport2.Expression.Type.SYMBOL).setSymbol(opRep);
-      }
+  static final ImmutableMap<String, Integer> OPERAND_SIZE_PREFIX_MAP =
+      ImmutableMap.of(
+          "byte ptr ", 1,
+          "word ptr ", 2,
+          "dword ptr ", 4,
+          "qword ptr ", 8,
+          "tword ptr ", 10,
+          "xmmword ptr ", 16);
+
+  // Ghidra separates operands of an instruction already for us.
+  // The separators and brackets don't and are difficult to represent any semantically meanings.
+  // Instead, it only helps to determine the priorities of expression tree nodes.
+  static final ImmutableSet<Character> OPERAND_SEPARATORS = ImmutableSet.of('+', ',', ':', '*');
+  static final ImmutableList<Character> OPERAND_OPEN_BRACKETS = ImmutableList.of('{', '[');
+  static final ImmutableList<Character> OPERAND_CLOSE_BRACKETS = ImmutableList.of('}', ']');
+
+  private Integer getOrAddExpression(BinExport2.Expression expr) {
+    int exprId = builder.getExpressionCount();
+    var exprIndex = expressionIndices.putIfAbsent(expr, exprId);
+    if (exprIndex == null) {
+      builder.addExpression(expr);
+      return exprId;
     }
+    return exprIndex;
   }
 
-  private void buildOperands(Map<String, Integer> expressionIndices) {
-    var entries = new ArrayList<>(expressionIndices.entrySet());
-    entries.sort(Entry.comparingByValue());
-    for (var entry : entries) {
-      builder.addOperandBuilder().addExpressionIndex(entry.getValue());
+  private Integer getOrAddStringTable(String str) {
+    int strId = builder.getStringTableCount();
+    var strIndex = stringIndices.putIfAbsent(str, strId);
+    if (strIndex == null) {
+      builder.addStringTable(str);
+      return strId;
     }
+    return strIndex;
+  }
+
+  private Optional<Integer> addCommentedExpression(
+      BinExport2.Expression.Builder exprBuilder,
+      Object markupToken,
+      Object valueToken,
+      List<BinExport2.Comment.Builder> comments,
+      int opExprIndex) {
+    if (markupToken.toString().equals(valueToken.toString())) {
+      return Optional.empty();
+    }
+
+    BinExport2.Comment.Type commentType;
+    if (markupToken instanceof VariableOffset) {
+      commentType = BinExport2.Comment.Type.LOCAL_REFERENCE;
+    } else if (markupToken instanceof LabelString) {
+      var labelType = ((LabelString) markupToken).getLabelType();
+      if (labelType == LabelString.CODE_LABEL) {
+        commentType = BinExport2.Comment.Type.GLOBAL_REFERENCE;
+      } else if (labelType == LabelString.VARIABLE) {
+        commentType = BinExport2.Comment.Type.LOCAL_REFERENCE;
+      } else if (labelType == LabelString.EXTERNAL) {
+        commentType = BinExport2.Comment.Type.DEFAULT;
+      } else {
+        return Optional.empty();
+      }
+    } else {
+      return Optional.empty();
+    }
+
+    var comment =
+        BinExport2.Comment.newBuilder()
+            .setOperandExpressionIndex(opExprIndex)
+            .setRepeatable(false)
+            .setType(commentType);
+    if (valueToken instanceof Register) {
+      exprBuilder =
+          exprBuilder.setType(BinExport2.Expression.Type.REGISTER).setSymbol(valueToken.toString());
+    } else if (valueToken instanceof Scalar) {
+      exprBuilder =
+          exprBuilder
+              .setType(BinExport2.Expression.Type.IMMEDIATE_INT)
+              .setImmediate(((Scalar) valueToken).getValue())
+              // Set the symbol field to be backwards-compatible.
+              .setSymbol(markupToken.toString());
+    } else if (valueToken instanceof Address) {
+      exprBuilder =
+          exprBuilder
+              .setType(BinExport2.Expression.Type.IMMEDIATE_INT)
+              .setImmediate(((Address) valueToken).getOffset())
+              // Set the symbol field to be backwards-compatible.
+              .setSymbol(markupToken.toString());
+    } else {
+      // Character, String
+      exprBuilder =
+          exprBuilder.setType(BinExport2.Expression.Type.SYMBOL).setSymbol(valueToken.toString());
+    }
+    var strIdx = getOrAddStringTable(markupToken.toString());
+    comments.add(comment.setStringTableIndex(strIdx));
+    return Optional.of(getOrAddExpression(exprBuilder.build()));
+  }
+
+  private void buildOperandExpressions(
+      Integer startOffset,
+      Integer endOffset,
+      ImmutableList<? extends Object> operandList,
+      ImmutableList<? extends Object> operandMarkupList,
+      Integer parentId,
+      List<Integer> opExprIndices,
+      Boolean addComment,
+      List<BinExport2.Comment.Builder> comments) {
+    if (startOffset >= endOffset) {
+      return;
+    }
+
+    var exprBuilder = BinExport2.Expression.newBuilder();
+    if (parentId != null) {
+      exprBuilder.setParentIndex(parentId);
+    }
+    // Find first non-enclosing separator
+    var openClosure = 0;
+    for (var i = startOffset; i < endOffset; i++) {
+      var token = operandMarkupList.get(i);
+
+      if (!(token instanceof Character)) {
+        continue;
+      }
+      if (OPERAND_OPEN_BRACKETS.contains(token)) {
+        openClosure++;
+        continue;
+      }
+      if (OPERAND_CLOSE_BRACKETS.contains(token)) {
+        openClosure--;
+        continue;
+      }
+      if (openClosure == 0 && OPERAND_SEPARATORS.contains(token)) {
+        var expr =
+            exprBuilder
+                .setType(BinExport2.Expression.Type.OPERATOR)
+                .setSymbol(token.toString())
+                .build();
+        var separatorId = getOrAddExpression(expr);
+        opExprIndices.add(separatorId);
+        buildOperandExpressions(
+            startOffset,
+            i,
+            operandList,
+            operandMarkupList,
+            separatorId,
+            opExprIndices,
+            addComment,
+            comments);
+        buildOperandExpressions(
+            i + 1,
+            endOffset,
+            operandList,
+            operandMarkupList,
+            separatorId,
+            opExprIndices,
+            addComment,
+            comments);
+        return;
+      }
+    }
+    // Strips trailing whitespaces
+    // Adds operator for trailing "!"
+    var lastToken = operandMarkupList.get(endOffset - 1);
+    if (lastToken instanceof Character) {
+      var ch = (Character) lastToken;
+      if (Character.isWhitespace(ch.charValue()) || ch.charValue() == '!') {
+        var nextParentId = parentId;
+        if (ch.charValue() == '!') {
+          var expr =
+              exprBuilder.setType(BinExport2.Expression.Type.OPERATOR).setSymbol("!").build();
+          nextParentId = getOrAddExpression(expr);
+          opExprIndices.add(nextParentId);
+        }
+        buildOperandExpressions(
+            startOffset,
+            endOffset - 1,
+            operandList,
+            operandMarkupList,
+            nextParentId,
+            opExprIndices,
+            addComment,
+            comments);
+        return;
+      }
+    }
+    // Adds other operands sequentially.
+    var firstToken = operandMarkupList.get(startOffset);
+    var nextParentId = parentId;
+    if (firstToken instanceof Character) {
+      var ch = (Character) firstToken;
+
+      // Add brackets enclosed expressions
+      var bracketIndex = OPERAND_OPEN_BRACKETS.indexOf(ch);
+      if (bracketIndex >= 0) {
+        var matchedClosure = 0;
+        for (var j = startOffset; j < endOffset; j++) {
+          var token = operandMarkupList.get(j);
+          if (!(token instanceof Character)) {
+            continue;
+          }
+          if (OPERAND_OPEN_BRACKETS.get(bracketIndex).equals(token)) {
+            matchedClosure++;
+          }
+          if (OPERAND_CLOSE_BRACKETS.get(bracketIndex).equals(token)) {
+            matchedClosure--;
+          }
+          if (matchedClosure == 0) {
+            var expr =
+                exprBuilder
+                    .setType(BinExport2.Expression.Type.DEREFERENCE)
+                    .setSymbol(ch.toString())
+                    .build();
+            nextParentId = getOrAddExpression(expr);
+            opExprIndices.add(nextParentId);
+            buildOperandExpressions(
+                startOffset + 1,
+                j,
+                operandList,
+                operandMarkupList,
+                nextParentId,
+                opExprIndices,
+                addComment,
+                comments);
+            buildOperandExpressions(
+                j + 1,
+                endOffset,
+                operandList,
+                operandMarkupList,
+                parentId,
+                opExprIndices,
+                addComment,
+                comments);
+            return;
+          }
+        }
+      }
+
+      if (ch.charValue() == '-') {
+        var expr = exprBuilder.setType(BinExport2.Expression.Type.OPERATOR).setSymbol("*").build();
+        nextParentId = getOrAddExpression(expr);
+        opExprIndices.add(nextParentId);
+        var negationExpr =
+            BinExport2.Expression.newBuilder()
+                .setParentIndex(nextParentId)
+                .setType(BinExport2.Expression.Type.IMMEDIATE_INT)
+                .setImmediate(-1)
+                .build();
+        opExprIndices.add(getOrAddExpression(negationExpr));
+      } else if (!Character.isWhitespace(ch.charValue()) && ch.charValue() != '#') {
+        var expr =
+            exprBuilder.setType(BinExport2.Expression.Type.SYMBOL).setSymbol(ch.toString()).build();
+        nextParentId = getOrAddExpression(expr);
+        opExprIndices.add(nextParentId);
+      }
+    } else if (firstToken instanceof Register) {
+      var expr =
+          exprBuilder
+              .setType(BinExport2.Expression.Type.REGISTER)
+              .setSymbol(firstToken.toString())
+              .build();
+      nextParentId = getOrAddExpression(expr);
+      opExprIndices.add(nextParentId);
+    } else if (firstToken instanceof Scalar) {
+      var expr =
+          exprBuilder
+              .setType(BinExport2.Expression.Type.IMMEDIATE_INT)
+              .setImmediate(((Scalar) firstToken).getValue())
+              .build();
+      nextParentId = getOrAddExpression(expr);
+      opExprIndices.add(nextParentId);
+    } else if (firstToken instanceof Address) {
+      var expr =
+          exprBuilder
+              .setType(BinExport2.Expression.Type.IMMEDIATE_INT)
+              .setImmediate(((Address) firstToken).getOffset())
+              .build();
+      nextParentId = getOrAddExpression(expr);
+      opExprIndices.add(nextParentId);
+    } else {
+      // String, List, VariableOffset, LabelString, etc.
+      Optional<Integer> commentedExprId = Optional.empty();
+      if (addComment) {
+        commentedExprId =
+            addCommentedExpression(
+                exprBuilder,
+                firstToken,
+                operandList.get(startOffset),
+                comments,
+                opExprIndices.size());
+      }
+      if (commentedExprId.isPresent()) {
+        nextParentId = commentedExprId.get();
+        opExprIndices.add(nextParentId);
+      } else {
+        var expr =
+            exprBuilder
+                .setType(BinExport2.Expression.Type.SYMBOL)
+                .setSymbol(firstToken.toString())
+                .build();
+        nextParentId = getOrAddExpression(expr);
+        opExprIndices.add(nextParentId);
+      }
+    }
+    buildOperandExpressions(
+        startOffset + 1,
+        endOffset,
+        operandList,
+        operandMarkupList,
+        nextParentId,
+        opExprIndices,
+        addComment,
+        comments);
+  }
+
+  private ImmutableList<Integer> buildInstructionOperands(
+      Instruction instr, CodeUnitFormat cuf, List<BinExport2.Comment.Builder> comments) {
+    int operandId = builder.getOperandCount();
+    var opIndices = new ArrayList<Integer>();
+    for (int i = 0; i < instr.getNumOperands(); i++) {
+      var operandComments = new ArrayList<BinExport2.Comment.Builder>();
+      var operandString = cuf.getOperandRepresentationString(instr, i);
+      var operandMarkupList = ImmutableList.copyOf(cuf.getOperandRepresentationList(instr, i));
+      var operandList = ImmutableList.copyOf(instr.getDefaultOperandRepresentationList(i));
+      Boolean addComment = operandMarkupList.size() == operandList.size();
+
+      Integer parentId = null;
+      var opExprIndices = new ArrayList<Integer>();
+
+      // Add size prefix if applicable
+      // Ghidra uses {@code java.lang.Character} to store each char of
+      // the size prefixes like "q", "w", "o", "r", "d", " ", "p", "t", "r", " "
+      for (var entry : OPERAND_SIZE_PREFIX_MAP.entrySet()) {
+        if (!operandString.startsWith(entry.getKey())) {
+          continue;
+        }
+        var expr =
+            BinExport2.Expression.newBuilder()
+                .setType(BinExport2.Expression.Type.SIZE_PREFIX)
+                .setSymbol("b" + entry.getValue())
+                .build();
+        parentId = getOrAddExpression(expr);
+        opExprIndices.add(parentId);
+        operandMarkupList =
+            operandMarkupList.subList(entry.getKey().length(), operandMarkupList.size());
+        operandList = operandList.subList(entry.getKey().length(), operandList.size());
+        break;
+      }
+      buildOperandExpressions(
+          0,
+          operandMarkupList.size(),
+          operandList,
+          operandMarkupList,
+          parentId,
+          opExprIndices,
+          addComment,
+          operandComments);
+
+      BinExport2.Operand operand =
+          BinExport2.Operand.newBuilder().addAllExpressionIndex(opExprIndices).build();
+      var opIndex = operandIndices.putIfAbsent(operand, operandId);
+
+      var opIdx = opIndices.size();
+      for (var comment : operandComments) {
+        comment.setInstructionOperandIndex(opIdx);
+        comments.add(comment);
+      }
+
+      if (opIndex == null) {
+        opIndices.add(operandId);
+        operandId++;
+        builder.addOperand(operand);
+      } else {
+        opIndices.add(opIndex);
+      }
+    }
+    return ImmutableList.copyOf(opIndices);
   }
 
   private void buildMnemonics(Map<String, Integer> mnemonicIndices) {
@@ -184,21 +550,21 @@ public class BinExport2Builder {
   }
 
   private void buildInstructions(
-      Map<String, Integer> mnemonics,
-      Map<String, Integer> expressionIndices,
-      Map<Long, Integer> instructionIndices) {
+      Map<String, Integer> mnemonics, Map<Long, Integer> instructionIndices) {
     monitor.setIndeterminate(false);
     monitor.setMessage("Exporting instructions");
     monitor.setMaximum(listing.getNumInstructions());
+    var cuf = new CodeUnitFormat(new CodeUnitFormatOptions());
     int progress = 0;
     Instruction prevInstr = null;
     long prevAddress = 0;
     int prevSize = 0;
-    int id = 0;
-    var cuf = new CodeUnitFormat(new CodeUnitFormatOptions());
     for (Instruction instr : listing.getInstructions(true)) {
+      var comments = new ArrayList<BinExport2.Comment.Builder>();
+
       long address = getMappedAddress(instr);
 
+      var id = builder.getInstructionCount();
       var instrBuilder = builder.addInstructionBuilder();
       // Write the full instruction address iff:
       // - there is no previous instruction
@@ -223,29 +589,36 @@ public class BinExport2Builder {
         // Only store if different from default value
         instrBuilder.setMnemonicIndex(mnemonicIndex);
       }
-      instructionIndices.put(address, id++);
+      instructionIndices.put(address, id);
 
-      // TODO(cblichmann): One expression per operand for now
-      for (int i = 0; i < instr.getNumOperands(); i++) {
-        var lookup = expressionIndices.get(cuf.getOperandRepresentationString(instr, i));
-        if (lookup == null) {
-          continue;
-        }
-        instrBuilder.addOperandIndex(lookup);
+      instrBuilder.addAllOperandIndex(buildInstructionOperands(instr, cuf, comments));
+
+      // Add all operand comments for this instruction.
+      for (var comment : comments) {
+        var commentIdx = builder.getCommentCount();
+        builder.addComment(comment.setInstructionIndex(id).build());
+        instrBuilder.addCommentIndex(commentIdx);
       }
 
       // Export call targets.
       for (Reference refFrom : instr.getReferencesFrom()) {
-        if (!refFrom.getReferenceType().isCall()) {
+        RefType refType = refFrom.getReferenceType();
+        if (!refType.isCall() && !refType.isJump()) {
           continue;
         }
+
         Address toAddr = refFrom.getToAddress();
+        if (listing.getFunctionAt(toAddr) == null) {
+          continue;
+        }
+
         if (toAddr.isExternalAddress()) {
           toAddr = getExternalLinkageAddress(toAddr);
           if (toAddr == null) {
             continue;
           }
         }
+
         instrBuilder.addCallTarget(getMappedAddress(toAddr));
       }
 
@@ -368,7 +741,7 @@ public class BinExport2Builder {
     }
   }
 
-  private void buildCallGraph() throws CancelledException {
+  private void buildCallGraphAndModuleList() throws CancelledException {
     var callGraph = builder.getCallGraphBuilder();
     FunctionManager funcManager = program.getFunctionManager();
     monitor.setIndeterminate(false);
@@ -377,6 +750,7 @@ public class BinExport2Builder {
     int id = 0;
     TreeMap<Address, Function> orderedFunctions = new TreeMap<>();
     Map<Long, Integer> vertexIndices = new HashMap<>();
+    Map<String, Integer> moduleIndices = new HashMap<>();
 
     // First round, create ordered function mapping because Ghidra does not guarantee the order of
     // external (imported) functions and BinExport requires ordered vertices
@@ -386,8 +760,6 @@ public class BinExport2Builder {
     }
     for (Function extFunc : funcManager.getExternalFunctions()) {
       monitor.setProgress(i++);
-      // External addresses exist in the EXTERNAL address space e.g. EXTERNAL:00000001
-      // We must map these to the linkage address referenced by instructions
       Address linkAddr = getExternalLinkageAddress(extFunc.getEntryPoint());
       if (linkAddr != null) {
         orderedFunctions.put(linkAddr, extFunc);
@@ -410,6 +782,21 @@ public class BinExport2Builder {
       }
       if (func.isExternal()) {
         vertex.setType(BinExport2.CallGraph.Vertex.Type.IMPORTED);
+        // Add module mapping
+        String moduleName = func.getParentNamespace().getName();
+        if (!moduleName.equals(Library.UNKNOWN)) {
+          if (moduleName.contains(".")) {
+            moduleName = moduleName.substring(0, moduleName.lastIndexOf('.'));
+          }
+          Integer moduleId =
+              moduleIndices.computeIfAbsent(
+                  moduleName,
+                  (String k) -> {
+                    builder.addModuleBuilder().setName(k);
+                    return builder.getModuleCount() - 1;
+                  });
+          vertex.setModuleIndex(moduleId);
+        }
       }
       if (!func.getName().equals(SymbolUtilities.getDefaultFunctionName(func.getEntryPoint()))) {
         // Ghidra does not seem to provide both mangled and demangled names
@@ -433,37 +820,21 @@ public class BinExport2Builder {
       if (entryPoint.isNonLoadedMemoryAddress()) {
         continue;
       }
+      id = vertexIndices.get(getMappedAddress(entryPoint));
 
-      var bbIter = bbModel.getCodeBlocksContaining(func.getBody(), monitor);
-      if (!bbIter.hasNext()) {
-        continue; // Skip empty flow graphs, they only exist as call graph nodes
-      }
-      id = vertexIndices.get(getMappedAddress(func.getEntryPoint()));
+      for (Function calledFunc : func.getCalledFunctions(monitor)) {
+        Address calledFuncAddr = calledFunc.getEntryPoint();
 
-      while (bbIter.hasNext()) {
-        CodeBlock bb = bbIter.next();
-
-        for (var bbDestIter = bb.getDestinations(monitor); bbDestIter.hasNext(); ) {
-          CodeBlockReference bbRef = bbDestIter.next();
-          FlowType flow = bbRef.getFlowType();
-          if (!flow.isCall()) {
+        if (calledFuncAddr.isExternalAddress()) {
+          calledFuncAddr = getExternalLinkageAddress(calledFuncAddr);
+          if (calledFuncAddr == null) {
             continue;
           }
+        }
 
-          Address destAddr = bbRef.getDestinationAddress();
-          if (destAddr.isExternalAddress()) {
-            // External addresses exist in the EXTERNAL address space e.g. EXTERNAL:00000001
-            // We must map these to the linkage address referenced by instructions
-            destAddr = getExternalLinkageAddress(destAddr);
-            if (destAddr == null) {
-              continue;
-            }
-          }
-
-          var targetId = vertexIndices.get(getMappedAddress(destAddr));
-          if (targetId != null) {
-            callGraph.addEdgeBuilder().setSourceVertexIndex(id).setTargetVertexIndex(targetId);
-          }
+        var targetId = vertexIndices.get(getMappedAddress(calledFuncAddr));
+        if (targetId != null) {
+          callGraph.addEdgeBuilder().setSourceVertexIndex(id).setTargetVertexIndex(targetId);
         }
       }
     }
@@ -479,11 +850,15 @@ public class BinExport2Builder {
 
       Address addr = getAddressFromLong(insnIndex.getKey());
       for (Reference ref : program.getReferenceManager().getReferencesFrom(addr)) {
-        if (ref.isMemoryReference() && ref.getReferenceType().isData()) {
+        Address toAddr = ref.getToAddress();
+
+        if (ref.isMemoryReference()
+            && ref.getReferenceType().isData()
+            && listing.getInstructionAt(toAddr) == null) {
           builder
               .addDataReferenceBuilder()
               .setInstructionIndex(insnIndex.getValue())
-              .setAddress(getMappedAddress(ref.getToAddress()));
+              .setAddress(getMappedAddress(toAddr));
         }
       }
     }
@@ -504,8 +879,7 @@ public class BinExport2Builder {
         continue;
       }
 
-      builder.addStringTable(str);
-      int strIdx = builder.getStringTableCount() - 1;
+      int strIdx = getOrAddStringTable(str);
 
       for (Reference refTo : data.getReferenceIteratorTo()) {
         Instruction insn = listing.getInstructionAt(refTo.getFromAddress());
@@ -549,8 +923,7 @@ public class BinExport2Builder {
         if (str == null || !comments.add(str)) {
           continue;
         }
-        builder.addStringTable(str);
-        int strIdx = builder.getStringTableCount() - 1;
+        int strIdx = getOrAddStringTable(str);
 
         builder
             .addCommentBuilder()
@@ -678,18 +1051,10 @@ public class BinExport2Builder {
 
     buildMetaInformation();
 
-    // TODO(cblichmann): Implement full expression trees. For now, each
-    //                   expression corresponds to exactly one operand. Those
-    //                   consist of Ghidra's string representation and are of
-    //                   type SYMBOL.
-    var expressionIndices = new HashMap<String, Integer>();
-    buildExpressions(expressionIndices);
-    buildOperands(expressionIndices);
-
     var mnemonics = new TreeMap<String, Integer>();
     buildMnemonics(mnemonics);
     var instructionIndices = new TreeMap<Long, Integer>();
-    buildInstructions(mnemonics, expressionIndices, instructionIndices);
+    buildInstructions(mnemonics, instructionIndices);
     monitor.setMessage("Exporting basic block structure");
     var basicBlockIndices = new HashMap<Long, Integer>();
     buildBasicBlocks(instructionIndices, basicBlockIndices);
@@ -701,7 +1066,7 @@ public class BinExport2Builder {
     monitor.setMessage("Exporting flow graphs");
     buildFlowGraphs(basicBlockIndices);
     monitor.setMessage("Exporting call graph");
-    buildCallGraph();
+    buildCallGraphAndModuleList();
     buildSections();
 
     return builder.build();

@@ -9,12 +9,6 @@ echo on
 set BUILD_DIR=%cd%\build
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
-unzip -q "%KOKORO_GFILE_DIR%\cmake-3.25.2-windows-x86_64.zip" -d "%BUILD_DIR%" || exit /b
-unzip -q "%KOKORO_GFILE_DIR%\ninja-win.zip" -d "%BUILD_DIR%" || exit /b
-
-set CMAKE_BIN=%BUILD_DIR%\cmake-3.25.2-windows-x86_64\bin
-set PATH=%PATH%;%CMAKE_BIN%
-
 :: Build BinExport
 set SRC_DIR=%KOKORO_ARTIFACTS_DIR%/git
 set OUT_DIR=%BUILD_DIR%
@@ -24,6 +18,9 @@ set DEPS_DIR=%BUILD_DIR%
 xcopy /q /s /e ^
   "%KOKORO_PIPER_DIR%\google3\third_party\jsoncpp" ^
   "%KOKORO_PIPER_DIR%\google3\third_party\binaryninja_api\third_party\jsoncpp\"
+
+:: Set up Visual Studio
+call C:\VS\VC\Auxiliary\Build\vcvarsall.bat x64
 
 pushd "%OUT_DIR%"
 cmake "%SRC_DIR%/binexport" ^
@@ -42,4 +39,3 @@ cmake --build . --config Release || exit /b
 ctest --build-config Release --output-on-failure -R "^[A-Z]" || exit /b
 cmake --install . --config Release --strip || exit /b
 popd
-
